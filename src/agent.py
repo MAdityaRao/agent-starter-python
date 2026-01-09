@@ -1,6 +1,8 @@
 import logging
+import json
+import os
 import gspread
-from google.oauth2.service_account import Credentials  # CHANGED: New Auth Library
+from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import (
@@ -15,7 +17,7 @@ from livekit.agents import (
     function_tool,
     RunContext,
 )
-from livekit.plugins import noise_cancellation, silero
+from livekit.plugins import noise_cancellation, silero, sarvam
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
@@ -23,42 +25,55 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 # --- Configuration ---
-GOOGLE_CREDENTIALS_FILE = "credentials.json"
-SHEET_NAME = "Hotel booking"  # Ensure this matches your Google Sheet name exactly
+# We no longer define a filename here. We look for the env var in the function.
+SHEET_NAME = "Hotel booking"
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""ROLE:
-    You are StayBot, a warm, friendly hotel receptionist at Grand Vista Hotel.
-    VOICE STYLE:
-    - Natural pacing
-    - Short sentences
-    - Occasional fillers like "Sure", "Alright", "Got it"
-    - Never sound scripted
-    - Smile while speaking
+            instructions="""
+ROLE:
+You are StayBot, a warm and polite hotel receptionist at Grand Vista Hotel in India.
 
-    CONVERSATION RULES:
-    1. Always ask for PHONE NUMBER before confirming booking.
-    2. Repeat key details once before confirmation.
-    3. Never jump steps.
+SPEAKING STYLE (VERY IMPORTANT):
+- Sound like an Indian hotel receptionist
+- Slight pauses between sentences
+- Calm, respectful tone
+- Clear English with Indian phrasing
+- Gentle fillers like:
+  "Sure", "Alright", "Okay ji", "No problem", "Let me check"
 
-    BOOKING FLOW (MANDATORY):
-    1. Greet
-    2. Ask dates (Check-in and Check-out)
-    3. Ask beds
-    4. Quote price
-    5. Ask name
-    6. Ask phone number
-    7. Repeat summary
-    8. Confirm booking -> Call the "book_room" tool.
-    9. Say goodbye naturally.
+DO NOT:
+- Sound American or British
+- Speak too fast
+- Use slang
 
-    BUSINESS RULES:
-    - ₹1000 per bed per night
-    - Max 2 beds
-    - Breakfast free if stay > 1 night
-    """
+EXAMPLES OF HOW YOU SPEAK:
+"Sure sir, I will help you."
+"Okay ji, may I know your check-in date?"
+"Alright, let me confirm the details once."
+
+CONVERSATION RULES:
+1. Always ask for PHONE NUMBER before confirming booking.
+2. Repeat key details once before confirmation.
+3. Never jump steps.
+
+BOOKING FLOW (MANDATORY):
+1. Greet first
+2. Ask check-in and check-out dates
+3. Ask number of beds
+4. Quote price
+5. Ask guest name
+6. Ask phone number
+7. Repeat booking summary
+8. Confirm booking → call book_room
+9. Say goodbye politely
+
+BUSINESS RULES:
+- ₹1000 per bed per night
+- Maximum 2 beds
+- Breakfast free if stay is more than 1 night
+"""
         )
 
     @function_tool
@@ -73,39 +88,41 @@ class Assistant(Agent):
     ):
         """
         Saves the confirmed booking details to the hotel's Google Sheet.
-        
-        Args:
-            guest_name: The full name of the guest.
-            phone: The guest's phone number.
-            check_in: Check-in date (e.g., "tomorrow" or a specific date).
-            check_out: Check-out date.
-            beds: Number of beds requested.
         """
         logger.info(f"Attempting to book for {guest_name}")
         
         try:
-            # --- CHANGED: Authenticate using google-auth ---
+            # --- CHANGED: Load Credentials from Environment Variable ---
+            json_creds_string = os.getenv("GOOGLE_CREDENTIALS_JSON")
+            
+            if not json_creds_string:
+                logger.error("Missing GOOGLE_CREDENTIALS_JSON environment variable.")
+                return "Error: System configuration error (Missing Credentials)."
+
+            # Parse the JSON string into a dictionary
+            creds_dict = json.loads(json_creds_string)
+
             scopes = [
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive"
             ]
             
-            creds = Credentials.from_service_account_file(
-                GOOGLE_CREDENTIALS_FILE, scopes=scopes
+            # Create credentials object from the dictionary info
+            creds = Credentials.from_service_account_info(
+                creds_dict, scopes=scopes
             )
             client = gspread.authorize(creds)
 
             # Open the sheet and append row
-            # Note: client.open opens the File, .sheet1 selects the first tab
             sheet = client.open(SHEET_NAME).sheet1
             sheet.append_row([guest_name, phone, check_in, check_out, beds])
             
             logger.info("Booking saved successfully.")
             return "Booking successfully saved to the system."
             
-        except FileNotFoundError:
-            logger.error("credentials.json file not found.")
-            return "Error: System offline (Credential file missing)."
+        except json.JSONDecodeError:
+            logger.error("GOOGLE_CREDENTIALS_JSON contains invalid JSON.")
+            return "Error: System configuration error (Invalid Credentials)."
         except Exception as e:
             logger.error(f"Failed to save booking: {e}")
             return "An error occurred while saving the booking."
@@ -129,12 +146,17 @@ async def my_agent(ctx: JobContext):
     }
 
     session = AgentSession(
-        stt=inference.STT(model="assemblyai/universal-streaming", language="en"),
-        llm=inference.LLM(model="openai/gpt-4.1-mini"),
-        tts=inference.TTS(
-            model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+        stt=inference.STT(
+            model="assemblyai/universal-streaming",
+            language="en"
         ),
-        turn_detection=MultilingualModel(),
+        llm=inference.LLM(
+            model="openai/gpt-4.1-mini"
+        ),
+        tts=sarvam.TTS(
+            target_language_code="en-IN",  # Indian English
+            speaker="anushka"              # Indian female voice
+        ),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
@@ -149,6 +171,13 @@ async def my_agent(ctx: JobContext):
                 else noise_cancellation.BVC(),
             ),
         ),
+    )
+    
+    # 🔹 FORCE INITIAL GREETING
+    await session.say(
+        "Namaste! Welcome to Grand Vista Hotel. "
+        "Sure, I can help you with your booking. "
+        "May I know your check-in and check-out dates?"
     )
 
     await ctx.connect()
